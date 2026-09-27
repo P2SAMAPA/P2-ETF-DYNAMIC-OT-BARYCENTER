@@ -7,14 +7,24 @@ regimes," and tests whether today's nearest regime (in Wasserstein /
 quantile-function distance) predicts next-day returns — across several
 regime-fit window sizes and (local_window, n_regimes) hyperparameter
 combinations. See barycenter_model.py for the theory.
+
+Regime persistence: the regime set is only re-fit every
+`regime_refit_interval` days (not daily), and the assignment only switches
+regimes when the new nearest one is closer by more than `persistence_margin`
+(hysteresis) — see barycenter_model.predict_with_hysteresis. Both exist to
+curb turnover-cost drag from noise-level day-to-day regime relabeling. Live
+runs also carry the previous run's regime assignment forward (best-effort,
+via the last pushed results file) so hysteresis works across separate
+scheduled runs, not just within one backtest.
 """
 
 import os
 import sys
 import json
+import glob
 import logging
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
@@ -23,7 +33,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
 from data_manager import load_master_data, validate_data
-from barycenter_model import compute_barycenter_series, RegimeBarycenterModel, nearest_analog_days
+from barycenter_model import (
+    compute_barycenter_series, RegimeBarycenterModel, nearest_analog_days, predict_with_hysteresis,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +51,13 @@ def backtest_window(returns: np.ndarray, barycenter_series: np.ndarray, window: 
     Walk-forward backtest of the barycenter-regime signal for one
     (regime-fit window, n_regimes) combination against a barycenter series
     already built with a particular local_window (see the caller).
+
+    The regime set is re-fit only every `regime_refit_interval` valid days
+    (not on every single day), and between refits the assignment is only
+    switched when hysteresis (`persistence_margin`) says the new nearest
+    regime is clearly better — see barycenter_model.predict_with_hysteresis.
+    This is what keeps predicted-return signs (and therefore turnover cost)
+    from flickering on noise-level day-to-day distance changes.
     """
     n_samples = len(returns)
     valid = ~np.isnan(barycenter_series).any(axis=1)
@@ -48,9 +67,16 @@ def backtest_window(returns: np.ndarray, barycenter_series: np.ndarray, window: 
 
     burn_in_fraction = cfg.get("burn_in_fraction", 0.05)
     min_train_samples = cfg.get("min_train_samples", 60)
+    refit_interval = max(1, cfg.get("regime_refit_interval", 21))
+    persistence_margin = cfg.get("persistence_margin", 0.10)
     start_pos = int(len(valid_idx) * burn_in_fraction)
 
-    predictions, actuals, distances, separations, r2s = [], [], [], [], []
+    predictions, actuals, distances, separations, r2s, switches = [], [], [], [], [], []
+
+    model = None
+    fit_result = None
+    current_regime = None
+    steps_since_refit = refit_interval  # forces a fit on the very first iteration
 
     for pos in range(start_pos, len(valid_idx) - 1):
         i = valid_idx[pos]                      # "today" — must itself have a valid barycenter
@@ -63,13 +89,18 @@ def backtest_window(returns: np.ndarray, barycenter_series: np.ndarray, window: 
             continue
 
         try:
-            B_train = barycenter_series[train_idx]
-            returns_next_train = returns[train_idx + 1]
+            if model is None or steps_since_refit >= refit_interval:
+                B_train = barycenter_series[train_idx]
+                returns_next_train = returns[train_idx + 1]
+                model = RegimeBarycenterModel(n_regimes=n_regimes)
+                fit_result = model.fit(B_train, returns_next_train)
+                current_regime = None   # unconditional nearest-regime pick right after a refit
+                steps_since_refit = 0
 
-            model = RegimeBarycenterModel(n_regimes=n_regimes)
-            fit_result = model.fit(B_train, returns_next_train)
+            pred = predict_with_hysteresis(model, barycenter_series[i], current_regime, persistence_margin)
+            current_regime = pred["regime"]
+            steps_since_refit += 1
 
-            pred = model.predict(barycenter_series[i])
             actual_returns = returns[i + 1]
 
             predictions.append(pred["predicted_returns"])
@@ -77,6 +108,7 @@ def backtest_window(returns: np.ndarray, barycenter_series: np.ndarray, window: 
             distances.append(pred["distance"])
             separations.append(pred["separation"])
             r2s.append(fit_result["in_sample_r2"])
+            switches.append(pred["switched"])
         except Exception:
             continue
 
@@ -98,7 +130,9 @@ def backtest_window(returns: np.ndarray, barycenter_series: np.ndarray, window: 
     # Turnover-based trading costs — same convention as the sheaf engine:
     # a cost is paid only when a ticker's position (long/flat/short, from
     # pred_sign) actually changes from one day to the next, not on every
-    # day a position is simply held.
+    # day a position is simply held. With regime persistence above, this
+    # should now track real forecast changes rather than K-means label
+    # noise, and come out noticeably lower than a daily-refit version.
     cost_bps = cfg.get("trading_cost_bps", 15)
     prev_position = np.zeros((1, pred_sign.shape[1]))
     position_history = np.vstack([prev_position, pred_sign])
@@ -126,6 +160,9 @@ def backtest_window(returns: np.ndarray, barycenter_series: np.ndarray, window: 
         "avg_regime_distance": float(np.mean(distances)),
         "avg_regime_separation": float(np.mean(separations)),
         "avg_in_sample_r2": float(np.mean(r2s)),
+        "avg_regime_switch_rate": float(np.mean(switches)),
+        "regime_refit_interval": refit_interval,
+        "persistence_margin": persistence_margin,
         "distance_series": [round(float(d), 4) for d in distances],
     }
 
@@ -173,23 +210,46 @@ def backtest_window_with_search(returns: np.ndarray, barycenter_series_by_lw: Di
     return best
 
 
-def _confidence_from_r2(r2: float) -> str:
-    if r2 > 0.01:
+def _confidence(oos_correlation: float, oos_directional_accuracy: float, in_sample_r2: float) -> str:
+    """
+    Confidence is graded primarily on OUT-OF-SAMPLE walk-forward validity
+    for the exact window that produced this pick — NOT on in-sample R^2
+    alone. In-sample R^2 looks reasonable almost by construction (K-means
+    is fit to explain that exact training data), so on its own it is not a
+    trustworthy signal: a window whose backtested predictions were actually
+    anti-correlated with real subsequent returns must never be labeled
+    "High confidence" just because its regime split fit its own training
+    data well.
+    """
+    if oos_correlation <= 0 or oos_directional_accuracy < 0.50:
+        return "Low"
+    if oos_correlation > 0.02 and oos_directional_accuracy > 0.51 and in_sample_r2 > 0.01:
         return "High"
-    elif r2 > 0.002:
+    if oos_correlation > 0.0:
         return "Medium"
     return "Low"
 
 
 def compute_ticker_picks(returns: np.ndarray, barycenter_series: np.ndarray, dates: List[str],
-                          tickers: List[str], window: int, n_regimes: int, cfg: Dict,
-                          top_n: int) -> Tuple[List[Dict], Dict, Dict]:
+                          tickers: List[str], window: int, n_regimes: int, cfg: Dict, top_n: int,
+                          oos_correlation: float = 0.0, oos_directional_accuracy: float = 0.5,
+                          previous_regime: Optional[int] = None) -> Tuple[List[Dict], Dict, Dict]:
     """
     Fit regimes on the most recent `window` valid days and return the
     top-N ETF picks by regime-conditional predicted next-day return, plus
     per-ticker detail and run diagnostics — including a 2D "regime map"
     for the dashboard, the today-vs-regime-centroid quantile curves, and
     the individual historical days today's distribution most resembles.
+
+    `oos_correlation` / `oos_directional_accuracy` should be this exact
+    window's walk-forward backtest metrics (from backtest_window), and
+    drive the confidence label — see _confidence.
+
+    `previous_regime` — the regime this same (universe, window,
+    n_regimes, local_window) combination was assigned to last run, if
+    known — applies the same hysteresis as the backtest so a live pick
+    doesn't flip on noise either. Pass None for an unconditional pick
+    (e.g. no prior state available, or the hyperparameters changed).
     """
     valid = ~np.isnan(barycenter_series).any(axis=1)
     valid_idx = np.where(valid)[0]
@@ -210,13 +270,14 @@ def compute_ticker_picks(returns: np.ndarray, barycenter_series: np.ndarray, dat
 
         model = RegimeBarycenterModel(n_regimes=n_regimes)
         fit_result = model.fit(B_train, returns_next_train)
-        pred = model.predict(barycenter_series[today_idx])
+        persistence_margin = cfg.get("persistence_margin", 0.10)
+        pred = predict_with_hysteresis(model, barycenter_series[today_idx], previous_regime, persistence_margin)
     except Exception as e:
         logger.error(f"  Barycenter fit failed (window={window}): {e}")
         return [], {}, {}
 
     pred_returns = pred["predicted_returns"]
-    confidence = _confidence_from_r2(fit_result["in_sample_r2"])
+    confidence = _confidence(oos_correlation, oos_directional_accuracy, fit_result["in_sample_r2"])
 
     ticker_results = {ticker: {"next_return": float(pred_returns[j])} for j, ticker in enumerate(tickers)}
 
@@ -282,9 +343,52 @@ def compute_ticker_picks(returns: np.ndarray, barycenter_series: np.ndarray, dat
         "nearest_analog_days": analogs,
         "regime_map": regime_map,
         "quantile_curves": quantile_curves,
+        "previous_regime": previous_regime,
+        "switched_from_previous": pred["switched"],
+        "oos_correlation_used_for_confidence": round(oos_correlation, 5),
+        "oos_directional_accuracy_used_for_confidence": round(oos_directional_accuracy, 4),
     }
 
     return picks, ticker_results, diagnostics
+
+
+def _load_previous_results(exclude_path: Optional[str] = None) -> Optional[Dict]:
+    """
+    Best-effort lookup of the most recent PREVIOUS results file — local
+    working directory first, then the HF results dataset — so regime
+    persistence (predict_with_hysteresis) has a "yesterday" to compare
+    against across separate scheduled runs, not just within one backtest.
+    This is advisory only: any failure just means today's run starts with
+    an unconditional (fresh) regime pick for every universe/window, same
+    as if this feature didn't exist.
+    """
+    candidates = sorted(glob.glob("barycenter_results_*.json"))
+    if exclude_path in candidates:
+        candidates.remove(exclude_path)
+    if candidates:
+        try:
+            with open(candidates[-1], "r") as f:
+                logger.info(f"Carrying regime state forward from local file: {candidates[-1]}")
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Found local previous-results file but couldn't parse it: {e}")
+
+    try:
+        from huggingface_hub import HfApi
+        token = config.HF_TOKEN or os.environ.get("HF_TOKEN")
+        api = HfApi(token=token)
+        files = api.list_repo_files(config.RESULTS_REPO, repo_type="dataset")
+        result_files = sorted(f for f in files if f.startswith("barycenter_results_") and f.endswith(".json"))
+        if not result_files:
+            return None
+        latest = result_files[-1]
+        local_path = api.hf_hub_download(repo_id=config.RESULTS_REPO, filename=latest, repo_type="dataset", token=token)
+        with open(local_path, "r") as f:
+            logger.info(f"Carrying regime state forward from HF results dataset: {latest}")
+            return json.load(f)
+    except Exception as e:
+        logger.info(f"No previous results found for regime-persistence carryover ({e}); starting fresh.")
+        return None
 
 
 def run_trainer() -> Dict:
@@ -298,6 +402,9 @@ def run_trainer() -> Dict:
         logger.error(f"Failed to load data: {e}")
         return {}
 
+    previous_results = _load_previous_results()
+    previous_regime_state = (previous_results or {}).get("regime_state", {})
+
     quantile_levels = np.array(config.QUANTILE_LEVELS)
     run_date = datetime.now().strftime("%Y-%m-%d")
     results = {
@@ -309,6 +416,7 @@ def run_trainer() -> Dict:
         "universes": {},
         "window_picks": {},
         "diagnostics": {},
+        "regime_state": {},
     }
 
     for universe_name, tickers in config.UNIVERSES.items():
@@ -367,7 +475,8 @@ def run_trainer() -> Dict:
                            f"Sharpe (net of {config.TRADING_COST_BPS}bps costs): {result['sharpe']:.2f} "
                            f"(gross: {result['sharpe_gross']:.2f}), "
                            f"n={result['n_predictions']}, "
-                           f"In-sample R²: {result['avg_in_sample_r2']:.4f}")
+                           f"In-sample R²: {result['avg_in_sample_r2']:.4f}, "
+                           f"Regime switch rate: {result['avg_regime_switch_rate']:.2%}")
             else:
                 logger.warning(f"    {result['error']}")
 
@@ -394,8 +503,11 @@ def run_trainer() -> Dict:
 
         results["window_picks"][universe_name] = {}
         results["diagnostics"][universe_name] = {}
+        results["regime_state"][universe_name] = {}
         best_win_ticker_results = {}
         best_win_diag = {}
+
+        prev_universe_state = previous_regime_state.get(universe_name, {})
 
         for window in config.WINDOWS:
             # Use the SAME hyperparameter combination that won this
@@ -409,11 +521,31 @@ def run_trainer() -> Dict:
                 b_series, _ = compute_barycenter_series(returns, lw, quantile_levels)
                 barycenter_by_lw[lw] = b_series
 
+            metrics = window_results.get(window, {})
+
+            # Only carry the previous regime forward if the winning
+            # hyperparameters for this window haven't changed since last
+            # run — otherwise the old regime index doesn't even refer to
+            # the same cluster set, so a fresh unconditional pick is
+            # correct, not a bug.
+            prev_state = prev_universe_state.get(str(window), {})
+            previous_regime = None
+            if prev_state.get("n_regimes") == nr and prev_state.get("local_window") == lw:
+                previous_regime = prev_state.get("regime")
+
             picks, ticker_results, diag = compute_ticker_picks(
-                returns, b_series, dates, available, window, nr, base_cfg, config.TOP_N
+                returns, b_series, dates, available, window, nr, base_cfg, config.TOP_N,
+                oos_correlation=metrics.get("correlation", 0.0),
+                oos_directional_accuracy=metrics.get("directional_accuracy", 0.5),
+                previous_regime=previous_regime,
             )
             results["window_picks"][universe_name][window] = picks
             results["diagnostics"][universe_name][window] = diag
+            results["regime_state"][universe_name][str(window)] = {
+                "regime": diag.get("regime"),
+                "n_regimes": nr,
+                "local_window": lw,
+            }
             if window == best_win:
                 best_win_ticker_results = ticker_results
                 best_win_diag = diag
@@ -424,8 +556,16 @@ def run_trainer() -> Dict:
             lw = hp.get("local_window", config.BARYCENTER_CONFIG["local_window"])
             nr = hp.get("n_regimes", config.BARYCENTER_CONFIG["n_regimes"])
             b_series = barycenter_by_lw.get(lw)
+            metrics = window_results.get(best_win, {})
+            prev_state = prev_universe_state.get(str(best_win), {})
+            previous_regime = prev_state.get("regime") if (
+                prev_state.get("n_regimes") == nr and prev_state.get("local_window") == lw
+            ) else None
             picks, best_win_ticker_results, best_win_diag = compute_ticker_picks(
-                returns, b_series, dates, available, best_win, nr, base_cfg, config.TOP_N
+                returns, b_series, dates, available, best_win, nr, base_cfg, config.TOP_N,
+                oos_correlation=metrics.get("correlation", 0.0),
+                oos_directional_accuracy=metrics.get("directional_accuracy", 0.5),
+                previous_regime=previous_regime,
             )
 
         results["top_picks"][universe_name] = picks

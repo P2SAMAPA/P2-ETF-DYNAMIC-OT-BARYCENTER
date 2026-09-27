@@ -398,12 +398,21 @@ def main():
 
             uni_diag = universes_meta.get(universe, {}).get("diagnostics", {})
             if uni_diag:
+                prev_regime = uni_diag.get("previous_regime")
+                if prev_regime is None:
+                    persistence_line = "No prior run state to compare against (cold start)."
+                elif uni_diag.get("switched_from_previous"):
+                    persistence_line = f"Regime <b>changed</b> since last run (was Regime {prev_regime})."
+                else:
+                    persistence_line = "Regime <b>unchanged</b> since last run (held via hysteresis)."
+
                 st.markdown(f"""
                 <div class="regime-note">
                     Assigned to <b>Regime {uni_diag.get('regime', '?')}</b>
                     ({uni_diag.get('regime_size', '?')} historical days, of {uni_diag.get('n_regimes_used', '?')} regimes fit)
                     &nbsp;|&nbsp; Distance to regime: <b>{uni_diag.get('regime_distance', 0):.3f}</b>
                     &nbsp;|&nbsp; Separation from 2nd-nearest regime: <b>{uni_diag.get('regime_separation', 0):.3f}</b>
+                    <br/>{persistence_line}
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -455,13 +464,17 @@ def main():
             best_window_val = str(int(best_row["Window"]))
             cost_bps = window_results.get(best_window_val, window_results.get(int(best_window_val), {})).get("trading_cost_bps_assumed", 15)
 
-            kpi_cols = st.columns(5)
+            best_window_switch_rate = (window_results.get(best_window_val, {})
+                                        or window_results.get(int(best_window_val), {})).get("avg_regime_switch_rate")
+
+            kpi_cols = st.columns(6)
             kpi_data = [
                 ("Best Window", f"{int(best_row['Window'])}d"),
                 ("Correlation", f"{best_row['Correlation']:.4f}"),
                 ("Directional Acc.", f"{best_row['Directional Accuracy']:.1f}%"),
                 ("Net Sharpe", f"{best_row['Net Sharpe']:.2f}"),
                 ("In-sample R²", f"{best_row['In-sample R²']:.4f}"),
+                ("Regime Switch Rate", f"{best_window_switch_rate*100:.1f}%" if best_window_switch_rate is not None else "N/A"),
             ]
             for col, (label, value) in zip(kpi_cols, kpi_data):
                 with col:
@@ -474,7 +487,10 @@ def main():
 
             st.caption(f"💸 Net Sharpe/returns above assume a {cost_bps}bps trading cost per position "
                        f"change (turnover), not a flat per-day charge. Best window is chosen by "
-                       f"return-prediction correlation, not by Sharpe.")
+                       f"return-prediction correlation, not by Sharpe. Regime Switch Rate is the share "
+                       f"of test days the regime assignment actually changed — the regime set is only "
+                       f"re-fit periodically and held via hysteresis in between, specifically to keep "
+                       f"this (and therefore turnover cost) low; see README for details.")
 
             st.markdown("<div style='margin-top: 0.9rem;'></div>", unsafe_allow_html=True)
 

@@ -57,11 +57,29 @@ QUANTILE_LEVELS = np.linspace(0.02, 0.98, 25).tolist()
 #                       individually protected by its own `window`-sized
 #                       training lookback, so a large global burn-in only
 #                       wastes usable out-of-sample days.
+# regime_refit_interval : how often (in valid trading days) the K-means
+#                       regime set is actually re-fit during walk-forward
+#                       testing/live prediction, instead of every single
+#                       day. Refitting daily lets cluster labels/centroids
+#                       drift noticeably from one day to the next even
+#                       when the underlying distribution barely moved,
+#                       which flips predicted-return signs (and therefore
+#                       triggers turnover cost) for no real informational
+#                       gain. 21 days (~1 trading month) matches
+#                       local_window's own timescale.
+# persistence_margin   : hysteresis threshold (see
+#                       barycenter_model.predict_with_hysteresis):
+#                       the regime assignment only switches away from the
+#                       previously-held regime if the new nearest regime
+#                       is closer by more than this fraction. 0.10 means a
+#                       10% closer match is required before switching.
 BARYCENTER_CONFIG = {
     "local_window": 21,
     "n_regimes": 6,
     "min_train_samples": 60,
     "burn_in_fraction": 0.05,
+    "regime_refit_interval": 21,
+    "persistence_margin": 0.10,
 }
 
 # Small hyperparameter grid searched PER WINDOW, per universe, selecting

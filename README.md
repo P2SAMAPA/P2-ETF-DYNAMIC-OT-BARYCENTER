@@ -71,6 +71,57 @@ requirements.txt        Same dependency set as the sheaf repo, minus networkx
                        visual is a distribution/regime map, not a graph)
 ```
 
+## Regime persistence (added after the first live run)
+
+The first real run of this engine (real master parquet, all three
+universes) surfaced two concrete problems, fixed as follows:
+
+1. **Turnover cost was eating most or all of the (already thin) edge.**
+   Root cause: the regime set was re-fit fresh via K-means on *every*
+   walk-forward day, so cluster labels could drift meaningfully day to
+   day even when the underlying distribution barely moved — flipping
+   predicted-return signs, and therefore turnover cost, for no real
+   informational gain. Fix: `regime_refit_interval` (default 21 days) —
+   the regime set is only re-fit periodically, not daily — plus
+   `persistence_margin` (default 0.10) — a hysteresis rule
+   (`barycenter_model.predict_with_hysteresis`) that only lets the
+   assignment switch away from the currently-held regime when the new
+   nearest one is closer by more than that margin. On a synthetic
+   smoke test this cut average daily trading cost roughly in half
+   (regime switch rate dropped from ~100% of days to ~10%) and turned
+   net Sharpe positive where it had been negative, at a modest cost to
+   gross Sharpe (less frequent re-estimation reacts a bit slower to a
+   genuine regime change — the expected trade-off).
+
+   Because this is a scheduled job with no persistent process between
+   runs, the hysteresis needs a "yesterday" to compare against across
+   separate `trainer.py` invocations, not just within one backtest.
+   Each run now saves a `regime_state` block to the results JSON
+   (per universe, per window: which regime it landed in, and which
+   `n_regimes`/`local_window` produced it), and the next run loads the
+   most recent previous results file (local file first, then the HF
+   results dataset — both best-effort; failure just means a fresh,
+   unconditional pick, same as before this feature existed) and passes
+   that regime forward as the hysteresis baseline. If a window's winning
+   hyperparameters changed since last run, the old regime index isn't
+   even comparable, so a fresh pick is used instead of a stale one.
+
+2. **Confidence was based only on in-sample R², decoupled from real
+   predictive validity.** The first run assigned "High confidence" to a
+   universe (EQUITY_SECTORS) whose selected window's actual walk-forward
+   correlation was *negative* — because in-sample R² will look
+   reasonable almost by construction (K-means is fit to explain that
+   exact training data), so on its own it isn't a valid trust signal.
+   Fix: confidence (`trainer._confidence`) is now graded primarily on
+   that window's **out-of-sample** correlation and directional accuracy
+   from the backtest — a negative or sub-50%-accuracy window is always
+   "Low" confidence regardless of how well its regime split fit its own
+   training data.
+
+`avg_regime_switch_rate` is now reported per window in the backtest
+results (and surfaced in the dashboard) specifically so this can be
+monitored going forward rather than only caught by hand.
+
 ## Running it
 
 ```bash
@@ -116,6 +167,16 @@ mean/std return, n_predictions) plus barycenter-specific diagnostics:
   this window's search.
 - `hyperparam_search` — the full comparison table of every combination
   tried for this window, not just the winner.
+- `avg_regime_switch_rate` — the share of walk-forward test days the
+  regime assignment actually changed (see "Regime persistence" above).
+  Low is the goal; a rate near 100% would mean hysteresis/periodic
+  refitting isn't doing anything.
+- `regime_refit_interval` / `persistence_margin` — the settings that
+  produced this result, echoed back for traceability.
+
+The top-level `regime_state` key (not per-universe metrics, but its own
+section) is what carries each universe/window's current regime forward
+into the next run for hysteresis — see "Regime persistence" above.
 
 Additional per-pick diagnostics (`window_picks` / `diagnostics` in the
 results JSON, surfaced in the dashboard):

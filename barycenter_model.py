@@ -187,6 +187,55 @@ class RegimeBarycenterModel:
         }
 
 
+def predict_with_hysteresis(model: "RegimeBarycenterModel", B_today: np.ndarray,
+                             current_regime: Optional[int], persistence_margin: float = 0.10) -> Dict:
+    """
+    Same nearest-regime lookup as RegimeBarycenterModel.predict, but with
+    hysteresis: the regime assignment only SWITCHES away from
+    `current_regime` (yesterday's assignment) if the new nearest regime is
+    closer by more than `persistence_margin` (a relative improvement), not
+    merely closer at all.
+
+    Why this matters: with a hard nearest-center rule, a day whose
+    barycenter sits near two regime centroids can flip back and forth
+    between them on essentially noise-level differences in distance, each
+    flip changing the predicted return sign for every ticker and therefore
+    triggering a full turnover-cost repricing for no real informational
+    gain. Requiring a clear margin before switching turns that flicker
+    into a stable holding period, at the cost of reacting slightly later
+    to a genuine regime change.
+
+    Pass `current_regime=None` to force a fresh (unconditional) nearest-
+    regime pick -- e.g. right after every periodic model refit, or on the
+    very first day with no prior state to carry forward.
+    """
+    centers = model.kmeans.cluster_centers_
+    dists = np.sqrt(np.sum((centers - np.asarray(B_today).reshape(1, -1)) ** 2, axis=1))
+    order = np.argsort(dists)
+    nearest = int(order[0])
+    second = int(order[1]) if len(order) > 1 else nearest
+
+    if current_regime is None or current_regime >= len(centers):
+        chosen = nearest
+    else:
+        current_dist = float(dists[current_regime])
+        nearest_dist = float(dists[nearest])
+        if nearest != current_regime and nearest_dist < current_dist * (1 - persistence_margin):
+            chosen = nearest
+        else:
+            chosen = current_regime
+
+    return {
+        "regime": chosen,
+        "distance": float(dists[chosen]),
+        "second_distance": float(dists[second]),
+        "separation": float(dists[second] - dists[nearest]),
+        "predicted_returns": model.regime_avg_return_[chosen],
+        "regime_size": int(model.regime_counts_[chosen]),
+        "switched": bool(current_regime is not None and chosen != current_regime),
+    }
+
+
 def nearest_analog_days(B_today: np.ndarray, B_history: np.ndarray, dates_history: List[str],
                          returns_next_history: np.ndarray, tickers: List[str],
                          top_n: int = 5) -> List[Dict]:
@@ -214,11 +263,17 @@ def nearest_analog_days(B_today: np.ndarray, B_history: np.ndarray, dates_histor
 
 
 def get_barycenter_predictions(barycenter_series: np.ndarray, returns: np.ndarray,
-                                window: int, n_regimes: int, min_train_samples: int = 60) -> Dict:
+                                window: int, n_regimes: int, min_train_samples: int = 60,
+                                previous_regime: Optional[int] = None,
+                                persistence_margin: float = 0.10) -> Dict:
     """
     Fit a RegimeBarycenterModel on the most recent `window` valid days and
     produce today's (the latest available day's) regime assignment and
     1-step-ahead return forecast for every ticker in the universe.
+
+    Pass `previous_regime` (e.g. carried over from yesterday's run) to
+    apply the same hysteresis as predict_with_hysteresis; leave it None
+    for a plain unconditional nearest-regime pick.
     """
     valid = ~np.isnan(barycenter_series).any(axis=1)
     valid_idx = np.where(valid)[0]
@@ -239,7 +294,7 @@ def get_barycenter_predictions(barycenter_series: np.ndarray, returns: np.ndarra
     fit_result = model.fit(B_train, returns_next_train)
 
     B_today = barycenter_series[today_idx]
-    pred = model.predict(B_today)
+    pred = predict_with_hysteresis(model, B_today, previous_regime, persistence_margin)
 
     return {
         "model": model,
