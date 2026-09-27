@@ -210,6 +210,46 @@ def backtest_window_with_search(returns: np.ndarray, barycenter_series_by_lw: Di
     return best
 
 
+def _select_best_window(window_results: Dict[int, Dict], min_directional_accuracy: float = 0.50) -> Tuple[int, Dict, bool]:
+    """
+    Select the best regime-fit window for live picks and reporting.
+
+    Gate: only windows whose out-of-sample directional accuracy clears
+    `min_directional_accuracy` are eligible at all — a window that is
+    wrong more than half the time has no business being called "best"
+    regardless of how its raw correlation compares to other windows this
+    close (concretely: on one real run, pure-correlation selection picked
+    a window with WORSE net Sharpe and WORSE directional accuracy than an
+    alternative window, because the correlation gap between them — 0.030
+    vs 0.023 — was itself within noise given a few thousand pooled,
+    serially-correlated daily observations).
+
+    Among windows that clear the gate, rank by a blend of correlation and
+    net Sharpe (rank-summed, since the two live on different scales) so a
+    window doesn't win purely on a fractionally higher correlation while
+    having a clearly worse, or negative, net-of-cost outcome.
+
+    If NO window clears the gate, the same blended ranking is applied as
+    a fallback over every window (a pick still has to be produced), but
+    the returned `gate_passed=False` records that none of them actually
+    validated — and downstream, `_confidence` already forces "Low"
+    whenever a window's own directional accuracy is under 50%, regardless
+    of this selection step, so a failed gate can never surface as a
+    confident-looking pick.
+    """
+    eligible = {w: r for w, r in window_results.items() if r.get("directional_accuracy", 0) >= min_directional_accuracy}
+    gate_passed = len(eligible) > 0
+    pool = eligible if gate_passed else window_results
+
+    windows = list(pool.keys())
+    corr_rank = {w: i for i, w in enumerate(sorted(windows, key=lambda w: pool[w].get("correlation", -999)))}
+    sharpe_rank = {w: i for i, w in enumerate(sorted(windows, key=lambda w: pool[w].get("sharpe", -999)))}
+    blended = {w: corr_rank[w] + sharpe_rank[w] for w in windows}
+
+    best_w = max(windows, key=lambda w: blended[w])
+    return best_w, pool[best_w], gate_passed
+
+
 def _confidence(oos_correlation: float, oos_directional_accuracy: float, in_sample_r2: float) -> str:
     """
     Confidence is graded primarily on OUT-OF-SAMPLE walk-forward validity
@@ -480,22 +520,26 @@ def run_trainer() -> Dict:
             else:
                 logger.warning(f"    {result['error']}")
 
-        # Best window selected by RETURN-PREDICTION quality (correlation
-        # between predicted and actual returns), not by backtested Sharpe
-        # — for the same reason as the sheaf engine: Sharpe reflects
-        # realized P&L, which can look good even from regime assignments
-        # that barely explain any real variance.
-        select_metric = config.BEST_WINDOW_METRIC
+        # Best window selection is GATED + BLENDED (see
+        # _select_best_window's docstring), not raw correlation alone —
+        # a window whose predictions are wrong more than half the time is
+        # never eligible, and among eligible windows the pick blends
+        # correlation with net Sharpe rather than trusting a fractional
+        # correlation edge that's itself within noise.
         if window_results:
-            best_window = max(window_results.items(), key=lambda x: x[1].get(select_metric, -999))
+            best_w, best_metrics, gate_passed = _select_best_window(window_results, config.MIN_DIRECTIONAL_ACCURACY)
             results["best_window"][universe_name] = {
-                "window": best_window[0],
-                "metrics": best_window[1],
-                "selected_by": select_metric,
+                "window": best_w,
+                "metrics": best_metrics,
+                "selected_by": "directional_accuracy_gate+blended(correlation,sharpe)",
+                "gate_passed": gate_passed,
+                "min_directional_accuracy_required": config.MIN_DIRECTIONAL_ACCURACY,
             }
-            logger.info(f"  ✅ Best window for {universe_name}: {best_window[0]} "
-                       f"(selected by {select_metric}={best_window[1][select_metric]:.4f}; "
-                       f"Sharpe: {best_window[1]['sharpe']:.2f})")
+            gate_note = "" if gate_passed else " ⚠️ NO window cleared the directional-accuracy gate — falling back to the best of a bad lot; confidence will reflect this."
+            logger.info(f"  ✅ Best window for {universe_name}: {best_w} "
+                       f"(correlation={best_metrics.get('correlation', 0):.4f}, "
+                       f"directional_accuracy={best_metrics.get('directional_accuracy', 0):.4f}, "
+                       f"Sharpe: {best_metrics.get('sharpe', 0):.2f}){gate_note}")
 
         results["backtest_results"][universe_name] = window_results
 

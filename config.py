@@ -109,9 +109,26 @@ TOP_N = 3
 TRADING_COST_BPS = 15
 
 # How the "best window" per universe is chosen for Tab 1's live picks.
-# "correlation" selects the window whose return PREDICTIONS were most
-# accurate historically — a direct measure of prediction quality, for
-# the same reason the sheaf engine avoids selecting by Sharpe: backtested
-# P&L can look good from a regime assignment that barely explains any
-# real variance, simply by riding the test period's market drift.
-BEST_WINDOW_METRIC = "correlation"
+#
+# Selection is now GATED + BLENDED, not raw correlation alone (an earlier
+# version selected purely by correlation, which on real data once picked
+# a window with WORSE net Sharpe and WORSE directional accuracy than an
+# alternative window, because the correlation gap between them was itself
+# within noise -- see trainer._select_best_window's docstring):
+#
+#   1. Gate: only windows whose out-of-sample directional accuracy meets
+#      MIN_DIRECTIONAL_ACCURACY are eligible at all. A window that is
+#      wrong more than half the time has no business being "best"
+#      regardless of its raw correlation.
+#   2. Among eligible windows, rank by a blend of correlation and net
+#      Sharpe (rank-summed, since the two are on different scales) so a
+#      window doesn't win purely on a fractionally higher correlation
+#      while having a clearly worse net-of-cost outcome.
+#   3. If NO window clears the gate, the same blended ranking is used as
+#      a fallback over every window (a pick still has to be produced),
+#      but `gate_passed: false` is recorded in the results, and
+#      `_confidence` already forces "Low" confidence whenever a window's
+#      own directional accuracy is under 50%, independent of this
+#      selection step.
+BEST_WINDOW_METRIC = "correlation"   # kept as one half of the blend, alongside net Sharpe
+MIN_DIRECTIONAL_ACCURACY = 0.50

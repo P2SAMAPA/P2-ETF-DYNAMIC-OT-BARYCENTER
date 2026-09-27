@@ -380,10 +380,19 @@ def main():
             best = best_window.get(universe, {})
             if best:
                 metrics = best.get("metrics", {})
+                gate_passed = best.get("gate_passed", True)
+                min_acc = best.get("min_directional_accuracy_required", 0.50)
+                gate_icon = "✅" if gate_passed else "⚠️"
+                gate_line = (
+                    f"passed the ≥{min_acc:.0%} directional-accuracy gate"
+                    if gate_passed else
+                    f"<b>did not clear</b> the ≥{min_acc:.0%} directional-accuracy gate — "
+                    f"this is the best of a bad lot, not a validated window"
+                )
                 st.markdown(f"""
                 <div class="best-window-banner">
-                    ✅ Best regime-fit window: <b>{best.get('window', 'N/A')} days</b>
-                    <span style="opacity:0.7;">(selected by return-prediction correlation, not Sharpe)</span>
+                    {gate_icon} Best regime-fit window: <b>{best.get('window', 'N/A')} days</b>
+                    <span style="opacity:0.7;">({gate_line}; ranked among eligible windows by a blend of correlation and net Sharpe)</span>
                     &nbsp;|&nbsp; Correlation: <b>{metrics.get('correlation', 0):.4f}</b>
                     &nbsp;|&nbsp; Directional accuracy: <b>{metrics.get('directional_accuracy', 0):.1%}</b>
                     &nbsp;|&nbsp; In-sample R²: <b>{metrics.get('avg_in_sample_r2', 0):.4f}</b>

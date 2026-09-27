@@ -201,24 +201,46 @@ next — a position held unchanged costs nothing extra.
 
 ## How the "best window" and barycenter hyperparameters are selected
 
-Same rationale as the sheaf engine: **Sharpe is not used to select
-anything**, because it reflects realized P&L, which can look good from a
-regime assignment that barely explains any real variance if it happens to
-ride the test period's market drift.
+**Updated after the second live run.** Pure-correlation window selection
+was replaced with a gated + blended selection after a real run showed it
+picking a window with *worse* net Sharpe AND *worse* directional accuracy
+than an alternative window, purely because its raw correlation was
+fractionally higher (0.0302 vs 0.0234) — a gap that's itself noise-level
+given a few thousand pooled, serially-correlated daily observations.
 
-- **Best window** (`config.BEST_WINDOW_METRIC`, default `"correlation"`):
-  selected by predicted-vs-actual return correlation.
+- **Best window** (`trainer._select_best_window`): a two-step selection.
+  1. **Gate** — only windows whose out-of-sample directional accuracy
+     meets `config.MIN_DIRECTIONAL_ACCURACY` (default 0.50) are eligible
+     at all. A window that's wrong more than half the time has no
+     business being called "best" regardless of its correlation.
+  2. **Blend** — among eligible windows, rank by correlation and net
+     Sharpe (rank-summed, since they're on different scales) so a window
+     doesn't win purely on a fractionally higher correlation while having
+     a clearly worse net-of-cost outcome.
+
+  If NO window clears the gate, the same blended ranking runs as a
+  fallback over every window (a live pick still has to be produced), but
+  `gate_passed: false` is recorded in `best_window[universe]` and shown
+  in the dashboard banner — and `_confidence` already forces "Low"
+  whenever a window's own directional accuracy is under 50%, independent
+  of this selection step, so a failed gate can never surface as a
+  confident-looking pick.
 - **Barycenter hyperparameters** (`config.BARYCENTER_GRID`): for each
   window, a small grid of `(local_window, n_regimes)` combinations is
-  backtested, and the one with the best out-of-sample correlation is used
-  both for that window's reported metrics AND for generating that window's
-  live picks (so the two are always consistent with each other).
+  still backtested and the one with the best out-of-sample correlation
+  is used both for that window's reported metrics AND for generating
+  that window's live picks (so the two stay consistent). This layer is
+  unchanged — the gate/blend fix above is specifically about choosing
+  *between windows*, not between hyperparameter combinations within one.
 
 **Multiple-comparisons caveat, stated plainly**: searching more combinations
 increases the chance that the "best" one simply got lucky on this
 particular test period, even if no combination is actually better than any
 other. The full `hyperparam_search` comparison table is kept and surfaced in
-the dashboard (Tab 2, per window) for exactly this reason.
+the dashboard (Tab 2, per window) for exactly this reason. The gate/blend
+above reduces but does not eliminate this risk — it just stops the most
+obviously wrong failure mode (picking a window that's actively worse on
+every metric that matters except the one used to select it).
 
 ## Backtest coverage (`BARYCENTER_CONFIG["burn_in_fraction"]`)
 
