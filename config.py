@@ -73,6 +73,21 @@ QUANTILE_LEVELS = np.linspace(0.02, 0.98, 25).tolist()
 #                       previously-held regime if the new nearest regime
 #                       is closer by more than this fraction. 0.10 means a
 #                       10% closer match is required before switching.
+# horizon              : PREDICTION TARGET horizon, in trading days — the
+#                       barycenter/regime machinery is unchanged, but the
+#                       "actual" it's trained and evaluated against is now
+#                       the CUMULATIVE forward return over this many days
+#                       (see barycenter_model.compute_forward_returns),
+#                       not tomorrow's single-day return. The original
+#                       design used a horizon of 1 implicitly; two real
+#                       backtests showed next-single-day directional
+#                       accuracy sitting at or below chance almost
+#                       everywhere, which single-day ETF returns are
+#                       plausibly just too noisy to predict from a
+#                       once-a-month-ish regime signal. 5 trading days
+#                       (~1 week) is the new default; BARYCENTER_GRID
+#                       below also searches 1/3/10/20 explicitly so this
+#                       assumption gets checked, not just asserted.
 BARYCENTER_CONFIG = {
     "local_window": 21,
     "n_regimes": 6,
@@ -80,6 +95,7 @@ BARYCENTER_CONFIG = {
     "burn_in_fraction": 0.05,
     "regime_refit_interval": 21,
     "persistence_margin": 0.10,
+    "horizon": 5,
 }
 
 # Small hyperparameter grid searched PER WINDOW, per universe, selecting
@@ -87,19 +103,30 @@ BARYCENTER_CONFIG = {
 # with BEST_WINDOW_METRIC below — prediction quality drives selection,
 # not backtested P&L). local_window controls how "local"/recent each
 # day's per-ETF distribution is before it enters the barycenter;
-# n_regimes controls how finely historical market states are carved up.
+# n_regimes controls how finely historical market states are carved up;
+# horizon controls how many trading days ahead the return target is
+# cumulated over (see BARYCENTER_CONFIG's "horizon" comment above). The
+# first 6 combos hold horizon at the new default (5d) and vary
+# local_window/n_regimes as before; the last 4 hold local_window/n_regimes
+# at their defaults and vary horizon, so the horizon question gets a
+# direct, isolated comparison rather than being tangled up with the other
+# two hyperparameters.
 #
 # IMPORTANT CAVEAT: as with the sheaf engine, searching more combinations
 # increases the risk of picking one that looks good by pure chance. The
 # trainer reports the FULL comparison table, not just the winner, so this
 # can be checked directly.
 BARYCENTER_GRID = [
-    {"n_regimes": 4, "local_window": 21},
-    {"n_regimes": 6, "local_window": 21},
-    {"n_regimes": 8, "local_window": 21},
-    {"n_regimes": 6, "local_window": 10},
-    {"n_regimes": 6, "local_window": 42},
-    {"n_regimes": 6, "local_window": 63},
+    {"n_regimes": 4, "local_window": 21, "horizon": 5},
+    {"n_regimes": 6, "local_window": 21, "horizon": 5},
+    {"n_regimes": 8, "local_window": 21, "horizon": 5},
+    {"n_regimes": 6, "local_window": 10, "horizon": 5},
+    {"n_regimes": 6, "local_window": 42, "horizon": 5},
+    {"n_regimes": 6, "local_window": 63, "horizon": 5},
+    {"n_regimes": 6, "local_window": 21, "horizon": 1},
+    {"n_regimes": 6, "local_window": 21, "horizon": 3},
+    {"n_regimes": 6, "local_window": 21, "horizon": 10},
+    {"n_regimes": 6, "local_window": 21, "horizon": 20},
 ]
 
 TOP_N = 3

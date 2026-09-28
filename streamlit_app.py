@@ -153,6 +153,9 @@ def render_pick_cards(picks, key_prefix):
         st.info("No ETF picks available for this selection.")
         return
 
+    horizon = picks[0].get("horizon_days") if picks else None
+    return_label = f"Expected {horizon}-day return" if horizon else "Expected return"
+
     cols = st.columns(min(len(picks), 3))
     for i, pick in enumerate(picks):
         color = conf_color(pick["confidence"])
@@ -161,20 +164,22 @@ def render_pick_cards(picks, key_prefix):
             <div class="pick-card" style="--accent: {color};">
                 <div class="pick-ticker">{pick['ticker']}</div>
                 <div class="pick-return">{pick['expected_return']:+.2f}%</div>
+                <div style="font-size:0.72rem; color:{SUBTLE}; margin-top:-0.2rem; margin-bottom:0.4rem;">{return_label}</div>
                 <span class="pick-badge">{pick['confidence']} confidence</span>
             </div>
             """, unsafe_allow_html=True)
 
 
-def render_analog_table(analogs):
+def render_analog_table(analogs, horizon=None):
     if not analogs:
         st.info("No historical analog days available for this selection.")
         return
+    fwd_label = f"{horizon}-day fwd %" if horizon else "fwd %"
     rows = []
     for a in analogs:
         row = {"Date": a["date"], "Distributional distance": round(a["distance"], 3)}
-        for ticker, ret in a.get("next_day_returns", {}).items():
-            row[f"{ticker} next-day %"] = round(ret * 100, 2)
+        for ticker, ret in a.get("forward_returns", {}).items():
+            row[f"{ticker} {fwd_label}"] = round(ret * 100, 2)
         rows.append(row)
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
@@ -271,7 +276,7 @@ def render_distance_chart(distance_series, key):
     fig.update_layout(
         height=220, margin=dict(l=10, r=10, t=10, b=10),
         plot_bgcolor="white", paper_bgcolor="white",
-        xaxis=dict(title="Test-period trading day", gridcolor="#eef2f7"),
+        xaxis=dict(title="Test period (non-overlapping, spaced by horizon)", gridcolor="#eef2f7"),
         yaxis=dict(title="Distance to nearest regime", gridcolor="#eef2f7"),
         font=dict(color=INK, size=11),
     )
@@ -391,7 +396,7 @@ def main():
                 )
                 st.markdown(f"""
                 <div class="best-window-banner">
-                    {gate_icon} Best regime-fit window: <b>{best.get('window', 'N/A')} days</b>
+                    {gate_icon} Best regime-fit window: <b>{best.get('window', 'N/A')} days</b> &nbsp;|&nbsp; Forecast horizon: <b>{metrics.get('horizon_days', '?')} trading days</b>
                     <span style="opacity:0.7;">({gate_line}; ranked among eligible windows by a blend of correlation and net Sharpe)</span>
                     &nbsp;|&nbsp; Correlation: <b>{metrics.get('correlation', 0):.4f}</b>
                     &nbsp;|&nbsp; Directional accuracy: <b>{metrics.get('directional_accuracy', 0):.1%}</b>
@@ -426,7 +431,7 @@ def main():
                 """, unsafe_allow_html=True)
 
                 with st.expander("Which historical days did today's distribution most resemble?"):
-                    render_analog_table(uni_diag.get("nearest_analog_days", []))
+                    render_analog_table(uni_diag.get("nearest_analog_days", []), horizon=uni_diag.get("horizon_days"))
 
             st.markdown("<div style='margin: 0.5rem 0 1.5rem 0;'></div>", unsafe_allow_html=True)
 
@@ -457,13 +462,14 @@ def main():
             df_results = pd.DataFrame([
                 {
                     "Window": int(w),
+                    "Horizon (d)": r.get("horizon_days", 1),
                     "Correlation": r.get("correlation", 0),
                     "Directional Accuracy": r.get("directional_accuracy", 0) * 100,
                     "Net Sharpe": r.get("sharpe", 0),
                     "Gross Sharpe": r.get("sharpe_gross", 0),
                     "In-sample R²": r.get("avg_in_sample_r2", 0),
-                    "Avg Cost (bps/day)": r.get("avg_daily_cost_bps", 0),
-                    "Predictions": r.get("n_predictions", 0),
+                    "Avg Cost (bps/rebalance)": r.get("avg_cost_bps_per_rebalance", 0),
+                    "Periods": r.get("n_predictions", 0),
                 }
                 for w, r in window_results.items()
             ]).sort_values("Window").reset_index(drop=True)
@@ -495,11 +501,11 @@ def main():
                     """, unsafe_allow_html=True)
 
             st.caption(f"💸 Net Sharpe/returns above assume a {cost_bps}bps trading cost per position "
-                       f"change (turnover), not a flat per-day charge. Best window is chosen by "
-                       f"return-prediction correlation, not by Sharpe. Regime Switch Rate is the share "
-                       f"of test days the regime assignment actually changed — the regime set is only "
-                       f"re-fit periodically and held via hysteresis in between, specifically to keep "
-                       f"this (and therefore turnover cost) low; see README for details.")
+                       f"change, charged once per rebalance (every Horizon days), not per day. Sharpe is "
+                       f"annualized by the number of non-overlapping horizon-length periods per year "
+                       f"(252/horizon), and each 'Period' is a non-overlapping test point — so a longer "
+                       f"horizon means fewer, but statistically independent, observations. Regime Switch "
+                       f"Rate is the share of test periods the regime assignment actually changed; see README.")
 
             st.markdown("<div style='margin-top: 0.9rem;'></div>", unsafe_allow_html=True)
 
@@ -513,8 +519,8 @@ def main():
                     "Net Sharpe": "{:.2f}",
                     "Gross Sharpe": "{:.2f}",
                     "In-sample R²": "{:.4f}",
-                    "Avg Cost (bps/day)": "{:.2f}",
-                    "Predictions": "{:,.0f}",
+                    "Avg Cost (bps/rebalance)": "{:.2f}",
+                    "Periods": "{:,.0f}",
                 }),
                 use_container_width=True,
                 hide_index=True,
@@ -537,7 +543,7 @@ def main():
             if hp_search:
                 st.markdown("###### Hyperparameter search (best window)")
                 st.caption(
-                    f"local_window / n_regimes were searched over {len(hp_search)} combinations for the "
+                    f"local_window / n_regimes / horizon were searched over {len(hp_search)} combinations for the "
                     f"{best_window_val}d window; the winner is highlighted. "
                     f"⚠️ Testing more combinations raises the chance the 'best' one just got lucky — "
                     f"if the winner isn't clearly ahead of the rest, treat its edge as noise."
@@ -557,10 +563,11 @@ def main():
                     hide_index=True,
                     column_config={
                         "local_window": "Local window (days)",
+                        "horizon_days": "Horizon (days)",
                         "n_regimes": "Regimes",
                         "correlation": "Correlation",
                         "sharpe": "Sharpe",
-                        "n_predictions": "Predictions",
+                        "n_predictions": "Periods",
                     },
                 )
 

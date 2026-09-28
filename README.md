@@ -34,7 +34,7 @@ space, but in the geometry of optimal transport?"*
   distance, to every regime centroid. The nearest regime directly answers
   *"which historical market state is today's distribution closest to, in
   distribution geometry rather than Euclidean feature space."* Each ticker's
-  forecast return is that regime's historical average next-day return,
+  forecast return is that regime's historical average forward return over the chosen horizon,
   computed only from training-period days assigned to the regime — a genuine
   walk-forward lookup, never a look-ahead.
 - **Regime distance ("distributional energy")** — the Wasserstein distance
@@ -70,6 +70,46 @@ requirements.txt        Same dependency set as the sheaf repo, minus networkx
                        (no network graph here — the barycenter's native
                        visual is a distribution/regime map, not a graph)
 ```
+
+## Forward horizon (added after the second live run)
+
+The first two real runs predicted **tomorrow's single-day return** and
+landed at or below 50% directional accuracy almost everywhere. That's
+plausible on its own terms: the barycenter is built from a rolling ~1-month
+window of daily returns, so it is a slow-moving object — a better candidate
+for explaining a return over the next several days than for calling one
+noisy daily print. The prediction target is now a **cumulative forward log
+return over `horizon` trading days** (`barycenter_model.compute_forward_returns`),
+default 5, and `config.BARYCENTER_GRID` also searches 1/3/10/20 days
+(holding `local_window`/`n_regimes` at defaults) so the assumption is
+tested, not asserted. The barycenter itself is unaffected by horizon.
+
+**This changes what the live picks mean.** Cards now read "Expected N-day
+return" — the top-3 ETFs by predicted return over the next N trading days,
+not "the best trade for tomorrow". If horizon 1 wins the search for a
+universe, it reverts to next-day naturally.
+
+Multi-day targets create a statistics trap: evaluating every day means
+successive 5-day targets share 4 of 5 days, which inflates apparent sample
+size and makes `sqrt(252)` Sharpe annualization wrong. So the backtest now:
+
+- **Steps by `horizon` days** between test points, so no two evaluated
+  forward-return periods overlap (`n_predictions` = non-overlapping periods;
+  a 20-day horizon has ~20x fewer than a 1-day horizon — fewer, but honest).
+- **Annualizes Sharpe by `sqrt(252/horizon)`**, the real number of
+  independent periods per year.
+- **Charges trading cost once per rebalance** (every `horizon` days), not
+  per day.
+- **Prevents leakage**: a training day is only used if its whole forward
+  window has resolved by "today" (`idx + horizon <= today`).
+
+Renamed result fields: `avg_daily_cost_bps` → `avg_cost_bps_per_rebalance`,
+`mean_return`/`std_return` → `*_per_period`; new `horizon_days` on every
+result and pick. Regime persistence state now also keys on `horizon`, so a
+changed winning horizon starts a fresh regime pick.
+
+**Not directly comparable to earlier runs**: metrics from horizon>1 rows use
+a different target, cadence and annualization than the single-day runs.
 
 ## Regime persistence (added after the first live run)
 
@@ -150,8 +190,8 @@ mean/std return, n_predictions) plus barycenter-specific diagnostics:
 
 - `sharpe` / `sharpe_gross` — Sharpe **net** of trading costs and **before**
   costs, so the cost drag is visible directly.
-- `avg_daily_cost_bps` — average trading cost actually paid per day
-  (turnover-driven).
+- `avg_cost_bps_per_rebalance` — average trading cost actually paid per
+  rebalance (every `horizon` days; turnover-driven).
 - `avg_regime_distance` / `avg_regime_separation` — how far, on average,
   today's barycenter sat from its nearest regime centroid, and how much
   further the 2nd-nearest regime was (a proxy for how "clean" the regime
@@ -190,7 +230,7 @@ results JSON, surfaced in the dashboard):
   like" overlay chart.
 - `nearest_analog_days` — the individual historical days (not just regime
   centroids) whose barycenter is closest to today's, with what each of
-  today's picked tickers did the next day on those analog days.
+  today's picked tickers did over the following `horizon` days on those analog days.
 
 ## Trading costs
 

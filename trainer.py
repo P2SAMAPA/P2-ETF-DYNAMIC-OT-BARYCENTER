@@ -4,18 +4,44 @@ trainer.py  —  P2 DYNAMIC-OT-BARYCENTER Trainer with Multi-Window Backtesting
 Builds a dynamic Wasserstein barycenter of each universe's ETF return
 distributions, clusters its historical trajectory into recurring "market
 regimes," and tests whether today's nearest regime (in Wasserstein /
-quantile-function distance) predicts next-day returns — across several
-regime-fit window sizes and (local_window, n_regimes) hyperparameter
-combinations. See barycenter_model.py for the theory.
+quantile-function distance) predicts a FORWARD return — across several
+regime-fit window sizes and (local_window, n_regimes, horizon)
+hyperparameter combinations. See barycenter_model.py for the theory.
+
+Why a forward horizon (not next-single-day)
+--------------------------------------------
+The original design predicted tomorrow's single-day return. Two real
+backtests on this engine's actual master data showed next-single-day
+directional accuracy sitting at or below 50% almost everywhere — which is
+plausible on its own terms: a barycenter built from a rolling ~1-month
+window of daily returns is itself a fairly slow-moving object, so it's a
+better candidate for explaining a slower-moving target (a return over the
+next several days) than for calling tomorrow's single noisy print. Horizon
+is now `config.BARYCENTER_CONFIG["horizon"]` (default 5 trading days) and
+is itself searched in `config.BARYCENTER_GRID` (1/3/5/10/20 days), so this
+is checked rather than just asserted.
+
+Predicting a forward return that spans multiple days means successive
+daily evaluation points would otherwise overlap (day t's 5-day-forward
+target shares 4 of its 5 days with day t+1's), which inflates apparent
+sample size and invalidates the usual sqrt(252) Sharpe annualization. This
+trainer avoids that by evaluating on a NON-OVERLAPPING cadence: each
+walk-forward test point is spaced `horizon` trading days apart, so no two
+evaluated forward-return periods share a day, and Sharpe is annualized by
+sqrt(252/horizon) (the correct number of independent periods per year for
+overlap-free horizon-length blocks) rather than sqrt(252). This costs
+sample size — a `horizon` of 20 has ~20x fewer evaluated points than
+`horizon`=1 over the same span of history, all else equal — but it is
+statistically honest, which a same-cadence overlapping alternative is not.
 
 Regime persistence: the regime set is only re-fit every
-`regime_refit_interval` days (not daily), and the assignment only switches
-regimes when the new nearest one is closer by more than `persistence_margin`
-(hysteresis) — see barycenter_model.predict_with_hysteresis. Both exist to
-curb turnover-cost drag from noise-level day-to-day regime relabeling. Live
-runs also carry the previous run's regime assignment forward (best-effort,
-via the last pushed results file) so hysteresis works across separate
-scheduled runs, not just within one backtest.
+`regime_refit_interval` days (not on every evaluation), and the assignment
+only switches regimes when the new nearest one is closer by more than
+`persistence_margin` (hysteresis) — see barycenter_model.predict_with_hysteresis.
+Both exist to curb turnover-cost drag from noise-level regime relabeling.
+Live runs also carry the previous run's regime assignment forward
+(best-effort, via the last pushed results file) so hysteresis works across
+separate scheduled runs, not just within one backtest.
 """
 
 import os
@@ -34,7 +60,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 from data_manager import load_master_data, validate_data
 from barycenter_model import (
-    compute_barycenter_series, RegimeBarycenterModel, nearest_analog_days, predict_with_hysteresis,
+    compute_barycenter_series, compute_forward_returns, RegimeBarycenterModel,
+    nearest_analog_days, predict_with_hysteresis,
 )
 
 logging.basicConfig(
@@ -45,21 +72,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def backtest_window(returns: np.ndarray, barycenter_series: np.ndarray, window: int,
-                     n_regimes: int, cfg: Dict) -> Dict:
+def backtest_window(barycenter_series: np.ndarray, forward_returns: np.ndarray, window: int,
+                     n_regimes: int, horizon: int, cfg: Dict) -> Dict:
     """
     Walk-forward backtest of the barycenter-regime signal for one
-    (regime-fit window, n_regimes) combination against a barycenter series
-    already built with a particular local_window (see the caller).
+    (regime-fit window, n_regimes, horizon) combination, against a
+    barycenter series already built with a particular local_window (see
+    the caller) and a forward-return series already built with this
+    `horizon` (see compute_forward_returns).
 
-    The regime set is re-fit only every `regime_refit_interval` valid days
-    (not on every single day), and between refits the assignment is only
-    switched when hysteresis (`persistence_margin`) says the new nearest
+    Evaluation steps by `horizon` trading days each time, so evaluated
+    forward-return periods never overlap (see module docstring) — days
+    are spaced apart, not every single day re-evaluated. The regime set
+    is additionally re-fit only every `regime_refit_interval` days (not
+    every evaluation step), and between refits the assignment only
+    switches when hysteresis (`persistence_margin`) says the new nearest
     regime is clearly better — see barycenter_model.predict_with_hysteresis.
-    This is what keeps predicted-return signs (and therefore turnover cost)
-    from flickering on noise-level day-to-day distance changes.
     """
-    n_samples = len(returns)
+    n_samples = len(forward_returns)
     valid = ~np.isnan(barycenter_series).any(axis=1)
     valid_idx = np.where(valid)[0]
     if len(valid_idx) < window + 50:
@@ -78,33 +108,36 @@ def backtest_window(returns: np.ndarray, barycenter_series: np.ndarray, window: 
     current_regime = None
     steps_since_refit = refit_interval  # forces a fit on the very first iteration
 
-    for pos in range(start_pos, len(valid_idx) - 1):
-        i = valid_idx[pos]                      # "today" — must itself have a valid barycenter
-        if i + 1 >= n_samples:
+    pos = start_pos
+    while pos < len(valid_idx) - 1:
+        i = valid_idx[pos]
+        pos += horizon   # always advance a full horizon: evaluated periods never overlap
+
+        if i + horizon >= n_samples or np.isnan(forward_returns[i]).any():
             continue
 
         train_idx = valid_idx[(valid_idx >= i - window) & (valid_idx < i)]
-        train_idx = train_idx[train_idx + 1 <= i]
+        train_idx = train_idx[train_idx + horizon <= i]   # no leakage: training target must already be resolved
         if len(train_idx) < min_train_samples:
             continue
 
         try:
             if model is None or steps_since_refit >= refit_interval:
                 B_train = barycenter_series[train_idx]
-                returns_next_train = returns[train_idx + 1]
+                fwd_train = forward_returns[train_idx]
                 model = RegimeBarycenterModel(n_regimes=n_regimes)
-                fit_result = model.fit(B_train, returns_next_train)
+                fit_result = model.fit(B_train, fwd_train)
                 current_regime = None   # unconditional nearest-regime pick right after a refit
                 steps_since_refit = 0
 
             pred = predict_with_hysteresis(model, barycenter_series[i], current_regime, persistence_margin)
             current_regime = pred["regime"]
-            steps_since_refit += 1
+            steps_since_refit += horizon
 
-            actual_returns = returns[i + 1]
+            actual = forward_returns[i]
 
             predictions.append(pred["predicted_returns"])
-            actuals.append(actual_returns)
+            actuals.append(actual)
             distances.append(pred["distance"])
             separations.append(pred["separation"])
             r2s.append(fit_result["in_sample_r2"])
@@ -115,7 +148,7 @@ def backtest_window(returns: np.ndarray, barycenter_series: np.ndarray, window: 
     if len(predictions) < 10:
         return {"error": "Not enough predictions", "window": window}
 
-    predictions = np.array(predictions)   # (n_steps, n_tickers)
+    predictions = np.array(predictions)   # (n_periods, n_tickers)
     actuals = np.array(actuals)
 
     correlation = np.corrcoef(predictions.flatten(), actuals.flatten())[0, 1]
@@ -125,14 +158,11 @@ def backtest_window(returns: np.ndarray, barycenter_series: np.ndarray, window: 
     actual_sign = np.sign(actuals)
     directional_accuracy = np.mean(pred_sign.flatten() == actual_sign.flatten())
 
-    gross_returns = actuals * pred_sign
+    gross_returns = actuals * pred_sign   # H-day period return earned per non-overlapping period
 
-    # Turnover-based trading costs — same convention as the sheaf engine:
-    # a cost is paid only when a ticker's position (long/flat/short, from
-    # pred_sign) actually changes from one day to the next, not on every
-    # day a position is simply held. With regime persistence above, this
-    # should now track real forecast changes rather than K-means label
-    # noise, and come out noticeably lower than a daily-refit version.
+    # Turnover-based trading cost, charged once per REBALANCE (i.e. once
+    # per evaluated period, every `horizon` days) rather than daily — a
+    # position held unchanged from one period to the next costs nothing.
     cost_bps = cfg.get("trading_cost_bps", 15)
     prev_position = np.zeros((1, pred_sign.shape[1]))
     position_history = np.vstack([prev_position, pred_sign])
@@ -141,21 +171,27 @@ def backtest_window(returns: np.ndarray, barycenter_series: np.ndarray, window: 
 
     net_returns = gross_returns - trading_cost
 
-    sharpe_gross = np.mean(gross_returns.flatten()) / (np.std(gross_returns.flatten()) + 1e-8) * np.sqrt(252)
-    sharpe_net = np.mean(net_returns.flatten()) / (np.std(net_returns.flatten()) + 1e-8) * np.sqrt(252)
+    # Annualize by the number of non-overlapping `horizon`-day periods
+    # actually in a year (252/horizon), not by sqrt(252) — periods here
+    # are horizon days long, and sqrt(252) would silently assume they're
+    # daily, overstating apparent significance for horizon > 1.
+    periods_per_year = 252.0 / horizon
+    sharpe_gross = np.mean(gross_returns.flatten()) / (np.std(gross_returns.flatten()) + 1e-8) * np.sqrt(periods_per_year)
+    sharpe_net = np.mean(net_returns.flatten()) / (np.std(net_returns.flatten()) + 1e-8) * np.sqrt(periods_per_year)
 
     return {
         "window": window,
-        "n_predictions": len(predictions),
+        "horizon_days": horizon,
+        "n_predictions": len(predictions),   # genuinely non-overlapping periods, not daily observations
         "correlation": float(correlation) if not np.isnan(correlation) else 0.0,
         "mse": float(mse),
         "directional_accuracy": float(directional_accuracy),
         "sharpe": float(sharpe_net),
         "sharpe_gross": float(sharpe_gross),
-        "mean_return": float(np.mean(net_returns.flatten())),
-        "mean_return_gross": float(np.mean(gross_returns.flatten())),
-        "std_return": float(np.std(net_returns.flatten())),
-        "avg_daily_cost_bps": float(np.mean(trading_cost.flatten()) * 10000.0),
+        "mean_return_per_period": float(np.mean(net_returns.flatten())),
+        "mean_return_gross_per_period": float(np.mean(gross_returns.flatten())),
+        "std_return_per_period": float(np.std(net_returns.flatten())),
+        "avg_cost_bps_per_rebalance": float(np.mean(trading_cost.flatten()) * 10000.0),
         "trading_cost_bps_assumed": cost_bps,
         "avg_regime_distance": float(np.mean(distances)),
         "avg_regime_separation": float(np.mean(separations)),
@@ -167,11 +203,12 @@ def backtest_window(returns: np.ndarray, barycenter_series: np.ndarray, window: 
     }
 
 
-def backtest_window_with_search(returns: np.ndarray, barycenter_series_by_lw: Dict[int, np.ndarray],
+def backtest_window_with_search(barycenter_series_by_lw: Dict[int, np.ndarray],
+                                 forward_returns_by_horizon: Dict[int, np.ndarray],
                                  window: int, base_cfg: Dict, grid: List[Dict]) -> Dict:
     """
-    Try each (local_window, n_regimes) combination in `grid` for this
-    window, keep the one with the best out-of-sample correlation
+    Try each (local_window, n_regimes, horizon) combination in `grid` for
+    this window, keep the one with the best out-of-sample correlation
     (consistent with BEST_WINDOW_METRIC). Returns the winner, with the
     winning hyperparameters recorded on it, plus a `hyperparam_search`
     list of every combination tried — so the winner's margin over the
@@ -181,10 +218,12 @@ def backtest_window_with_search(returns: np.ndarray, barycenter_series_by_lw: Di
     for combo in grid:
         lw = combo.get("local_window", base_cfg.get("local_window"))
         nr = combo.get("n_regimes", base_cfg.get("n_regimes"))
+        horizon = combo.get("horizon", base_cfg.get("horizon"))
         B = barycenter_series_by_lw.get(lw)
-        if B is None:
+        FR = forward_returns_by_horizon.get(horizon)
+        if B is None or FR is None:
             continue
-        result = backtest_window(returns, B, window, nr, base_cfg)
+        result = backtest_window(B, FR, window, nr, horizon, base_cfg)
         if "error" not in result:
             result = dict(result)
             result["local_window"] = lw
@@ -201,6 +240,7 @@ def backtest_window_with_search(returns: np.ndarray, barycenter_series_by_lw: Di
         {
             "local_window": c["local_window"],
             "n_regimes": c["n_regimes"],
+            "horizon_days": c["horizon_days"],
             "correlation": round(c["correlation"], 5),
             "sharpe": round(c["sharpe"], 3),
             "n_predictions": c["n_predictions"],
@@ -220,9 +260,9 @@ def _select_best_window(window_results: Dict[int, Dict], min_directional_accurac
     regardless of how its raw correlation compares to other windows this
     close (concretely: on one real run, pure-correlation selection picked
     a window with WORSE net Sharpe and WORSE directional accuracy than an
-    alternative window, because the correlation gap between them — 0.030
-    vs 0.023 — was itself within noise given a few thousand pooled,
-    serially-correlated daily observations).
+    alternative window, because the correlation gap between them was
+    itself within noise given a few thousand pooled, serially-correlated
+    observations).
 
     Among windows that clear the gate, rank by a blend of correlation and
     net Sharpe (rank-summed, since the two live on different scales) so a
@@ -270,25 +310,26 @@ def _confidence(oos_correlation: float, oos_directional_accuracy: float, in_samp
     return "Low"
 
 
-def compute_ticker_picks(returns: np.ndarray, barycenter_series: np.ndarray, dates: List[str],
-                          tickers: List[str], window: int, n_regimes: int, cfg: Dict, top_n: int,
+def compute_ticker_picks(barycenter_series: np.ndarray, forward_returns: np.ndarray, dates: List[str],
+                          tickers: List[str], window: int, n_regimes: int, horizon: int, cfg: Dict, top_n: int,
                           oos_correlation: float = 0.0, oos_directional_accuracy: float = 0.5,
                           previous_regime: Optional[int] = None) -> Tuple[List[Dict], Dict, Dict]:
     """
     Fit regimes on the most recent `window` valid days and return the
-    top-N ETF picks by regime-conditional predicted next-day return, plus
-    per-ticker detail and run diagnostics — including a 2D "regime map"
-    for the dashboard, the today-vs-regime-centroid quantile curves, and
-    the individual historical days today's distribution most resembles.
+    top-N ETF picks by regime-conditional predicted `horizon`-day forward
+    return, plus per-ticker detail and run diagnostics — including a 2D
+    "regime map" for the dashboard, the today-vs-regime-centroid quantile
+    curves, and the individual historical days today's distribution most
+    resembles.
 
     `oos_correlation` / `oos_directional_accuracy` should be this exact
     window's walk-forward backtest metrics (from backtest_window), and
     drive the confidence label — see _confidence.
 
     `previous_regime` — the regime this same (universe, window,
-    n_regimes, local_window) combination was assigned to last run, if
-    known — applies the same hysteresis as the backtest so a live pick
-    doesn't flip on noise either. Pass None for an unconditional pick
+    n_regimes, local_window, horizon) combination was assigned to last
+    run, if known — applies the same hysteresis as the backtest so a live
+    pick doesn't flip on noise either. Pass None for an unconditional pick
     (e.g. no prior state available, or the hyperparameters changed).
     """
     valid = ~np.isnan(barycenter_series).any(axis=1)
@@ -298,7 +339,7 @@ def compute_ticker_picks(returns: np.ndarray, barycenter_series: np.ndarray, dat
 
     today_idx = valid_idx[-1]
     train_idx = valid_idx[(valid_idx >= today_idx - window) & (valid_idx < today_idx)]
-    train_idx = train_idx[train_idx + 1 <= today_idx]
+    train_idx = train_idx[train_idx + horizon <= today_idx]
 
     min_train_samples = cfg.get("min_train_samples", 60)
     if len(train_idx) < min_train_samples:
@@ -306,10 +347,10 @@ def compute_ticker_picks(returns: np.ndarray, barycenter_series: np.ndarray, dat
 
     try:
         B_train = barycenter_series[train_idx]
-        returns_next_train = returns[train_idx + 1]
+        fwd_train = forward_returns[train_idx]
 
         model = RegimeBarycenterModel(n_regimes=n_regimes)
-        fit_result = model.fit(B_train, returns_next_train)
+        fit_result = model.fit(B_train, fwd_train)
         persistence_margin = cfg.get("persistence_margin", 0.10)
         pred = predict_with_hysteresis(model, barycenter_series[today_idx], previous_regime, persistence_margin)
     except Exception as e:
@@ -319,23 +360,30 @@ def compute_ticker_picks(returns: np.ndarray, barycenter_series: np.ndarray, dat
     pred_returns = pred["predicted_returns"]
     confidence = _confidence(oos_correlation, oos_directional_accuracy, fit_result["in_sample_r2"])
 
-    ticker_results = {ticker: {"next_return": float(pred_returns[j])} for j, ticker in enumerate(tickers)}
+    ticker_results = {ticker: {"expected_forward_return": float(pred_returns[j])} for j, ticker in enumerate(tickers)}
 
-    sorted_picks = sorted(ticker_results.items(), key=lambda x: x[1]["next_return"], reverse=True)
+    sorted_picks = sorted(ticker_results.items(), key=lambda x: x[1]["expected_forward_return"], reverse=True)
     top_picks = sorted_picks[:top_n]
     picks = [
-        {"ticker": ticker, "expected_return": round(info["next_return"] * 100, 2), "confidence": confidence}
+        {
+            "ticker": ticker,
+            "expected_return": round(info["expected_forward_return"] * 100, 2),
+            "horizon_days": horizon,
+            "confidence": confidence,
+        }
         for ticker, info in top_picks
     ]
 
-    # Individual-day analogs — only among days strictly BEFORE today, no leakage.
+    # Individual-day analogs — only among days strictly BEFORE today, and
+    # whose own forward-return outcome is already fully resolved (no
+    # leakage), matching the same rule used for training pairs above.
     hist_idx = valid_idx[valid_idx < today_idx]
-    hist_idx = hist_idx[hist_idx + 1 <= today_idx]
+    hist_idx = hist_idx[hist_idx + horizon <= today_idx]
     analogs = []
     if len(hist_idx) > 0:
         analogs = nearest_analog_days(
             barycenter_series[today_idx], barycenter_series[hist_idx],
-            [dates[k] for k in hist_idx], returns[hist_idx + 1], tickers, top_n=5,
+            [dates[k] for k in hist_idx], forward_returns[hist_idx], tickers, top_n=5,
         )
 
     # 2D regime map for the dashboard: PCA projection of the (small)
@@ -380,6 +428,7 @@ def compute_ticker_picks(returns: np.ndarray, barycenter_series: np.ndarray, dat
         "n_regimes_used": fit_result["n_regimes_fit"],
         "regime_counts": fit_result["regime_counts"],
         "n_regimes_requested": n_regimes,
+        "horizon_days": horizon,
         "nearest_analog_days": analogs,
         "regime_map": regime_map,
         "quantile_curves": quantile_curves,
@@ -478,13 +527,20 @@ def run_trainer() -> Dict:
         dates = [d.strftime("%Y-%m-%d") for d in universe_prices_df.index[1:]]
 
         # Precompute the barycenter time series ONCE per distinct
-        # local_window value used anywhere in the grid, instead of
-        # recomputing it inside every backtest iteration — the same
+        # local_window value used anywhere in the grid (barycenter
+        # construction is horizon-independent — it's built purely from
+        # each ETF's own trailing DAILY return distribution), and the
+        # forward-return series ONCE per distinct horizon — instead of
+        # recomputing either inside every backtest iteration. Same
         # "compute the expensive rolling thing once, slice it many times"
         # pattern used across the engine suite to stay inside the GitHub
         # Actions free-tier CPU budget.
         distinct_local_windows = sorted({
             combo.get("local_window", config.BARYCENTER_CONFIG["local_window"])
+            for combo in config.BARYCENTER_GRID
+        })
+        distinct_horizons = sorted({
+            combo.get("horizon", config.BARYCENTER_CONFIG["horizon"])
             for combo in config.BARYCENTER_GRID
         })
         barycenter_by_lw = {}
@@ -493,6 +549,10 @@ def run_trainer() -> Dict:
             b_series, _ = compute_barycenter_series(returns, lw, quantile_levels)
             barycenter_by_lw[lw] = b_series
 
+        forward_returns_by_horizon = {}
+        for h in distinct_horizons:
+            forward_returns_by_horizon[h] = compute_forward_returns(returns, h)
+
         base_cfg = config.BARYCENTER_CONFIG.copy()
         base_cfg["trading_cost_bps"] = config.TRADING_COST_BPS
 
@@ -500,21 +560,22 @@ def run_trainer() -> Dict:
         window_hyperparams = {}
         for window in config.WINDOWS:
             logger.info(f"  Testing window {window} ({len(config.BARYCENTER_GRID)} hyperparameter combos)...")
-            result = backtest_window_with_search(returns, barycenter_by_lw, window, base_cfg, config.BARYCENTER_GRID)
+            result = backtest_window_with_search(barycenter_by_lw, forward_returns_by_horizon, window, base_cfg, config.BARYCENTER_GRID)
 
             if "error" not in result:
                 window_results[window] = result
                 window_hyperparams[window] = {
                     "local_window": result["local_window"],
                     "n_regimes": result["n_regimes"],
+                    "horizon": result["horizon_days"],
                 }
                 logger.info(f"    Best combo: local_window={result['local_window']}, "
-                           f"n_regimes={result['n_regimes']} -> "
+                           f"n_regimes={result['n_regimes']}, horizon={result['horizon_days']}d -> "
                            f"Correlation: {result['correlation']:.4f}, "
                            f"Directional: {result['directional_accuracy']:.2%}, "
                            f"Sharpe (net of {config.TRADING_COST_BPS}bps costs): {result['sharpe']:.2f} "
                            f"(gross: {result['sharpe_gross']:.2f}), "
-                           f"n={result['n_predictions']}, "
+                           f"n={result['n_predictions']} non-overlapping periods, "
                            f"In-sample R²: {result['avg_in_sample_r2']:.4f}, "
                            f"Regime switch rate: {result['avg_regime_switch_rate']:.2%}")
             else:
@@ -537,7 +598,8 @@ def run_trainer() -> Dict:
             }
             gate_note = "" if gate_passed else " ⚠️ NO window cleared the directional-accuracy gate — falling back to the best of a bad lot; confidence will reflect this."
             logger.info(f"  ✅ Best window for {universe_name}: {best_w} "
-                       f"(correlation={best_metrics.get('correlation', 0):.4f}, "
+                       f"(horizon={best_metrics.get('horizon_days')}d, "
+                       f"correlation={best_metrics.get('correlation', 0):.4f}, "
                        f"directional_accuracy={best_metrics.get('directional_accuracy', 0):.4f}, "
                        f"Sharpe: {best_metrics.get('sharpe', 0):.2f}){gate_note}")
 
@@ -556,29 +618,37 @@ def run_trainer() -> Dict:
         for window in config.WINDOWS:
             # Use the SAME hyperparameter combination that won this
             # window's backtest, so live picks reflect the regime set
-            # that was actually validated, not a different default guess.
+            # (and horizon) that was actually validated, not a different
+            # default guess.
             hp = window_hyperparams.get(window, {})
             lw = hp.get("local_window", config.BARYCENTER_CONFIG["local_window"])
             nr = hp.get("n_regimes", config.BARYCENTER_CONFIG["n_regimes"])
+            horizon = hp.get("horizon", config.BARYCENTER_CONFIG["horizon"])
             b_series = barycenter_by_lw.get(lw)
             if b_series is None:
                 b_series, _ = compute_barycenter_series(returns, lw, quantile_levels)
                 barycenter_by_lw[lw] = b_series
+            fwd_series = forward_returns_by_horizon.get(horizon)
+            if fwd_series is None:
+                fwd_series = compute_forward_returns(returns, horizon)
+                forward_returns_by_horizon[horizon] = fwd_series
 
             metrics = window_results.get(window, {})
 
             # Only carry the previous regime forward if the winning
             # hyperparameters for this window haven't changed since last
-            # run — otherwise the old regime index doesn't even refer to
-            # the same cluster set, so a fresh unconditional pick is
+            # run — otherwise the old regime index isn't even comparable
+            # (different local_window/n_regimes/horizon = a different
+            # cluster set entirely), so a fresh unconditional pick is
             # correct, not a bug.
             prev_state = prev_universe_state.get(str(window), {})
             previous_regime = None
-            if prev_state.get("n_regimes") == nr and prev_state.get("local_window") == lw:
+            if (prev_state.get("n_regimes") == nr and prev_state.get("local_window") == lw
+                    and prev_state.get("horizon") == horizon):
                 previous_regime = prev_state.get("regime")
 
             picks, ticker_results, diag = compute_ticker_picks(
-                returns, b_series, dates, available, window, nr, base_cfg, config.TOP_N,
+                b_series, fwd_series, dates, available, window, nr, horizon, base_cfg, config.TOP_N,
                 oos_correlation=metrics.get("correlation", 0.0),
                 oos_directional_accuracy=metrics.get("directional_accuracy", 0.5),
                 previous_regime=previous_regime,
@@ -589,6 +659,7 @@ def run_trainer() -> Dict:
                 "regime": diag.get("regime"),
                 "n_regimes": nr,
                 "local_window": lw,
+                "horizon": horizon,
             }
             if window == best_win:
                 best_win_ticker_results = ticker_results
@@ -599,14 +670,17 @@ def run_trainer() -> Dict:
             hp = window_hyperparams.get(best_win, {})
             lw = hp.get("local_window", config.BARYCENTER_CONFIG["local_window"])
             nr = hp.get("n_regimes", config.BARYCENTER_CONFIG["n_regimes"])
+            horizon = hp.get("horizon", config.BARYCENTER_CONFIG["horizon"])
             b_series = barycenter_by_lw.get(lw)
+            fwd_series = forward_returns_by_horizon.get(horizon)
             metrics = window_results.get(best_win, {})
             prev_state = prev_universe_state.get(str(best_win), {})
             previous_regime = prev_state.get("regime") if (
                 prev_state.get("n_regimes") == nr and prev_state.get("local_window") == lw
+                and prev_state.get("horizon") == horizon
             ) else None
             picks, best_win_ticker_results, best_win_diag = compute_ticker_picks(
-                returns, b_series, dates, available, best_win, nr, base_cfg, config.TOP_N,
+                b_series, fwd_series, dates, available, best_win, nr, horizon, base_cfg, config.TOP_N,
                 oos_correlation=metrics.get("correlation", 0.0),
                 oos_directional_accuracy=metrics.get("directional_accuracy", 0.5),
                 previous_regime=previous_regime,
@@ -622,7 +696,7 @@ def run_trainer() -> Dict:
 
         logger.info(f"  ✅ Top picks for {universe_name}:")
         for pick in picks:
-            logger.info(f"     {pick['ticker']}: {pick['expected_return']}% ({pick['confidence']})")
+            logger.info(f"     {pick['ticker']}: {pick['expected_return']}% over {pick['horizon_days']}d ({pick['confidence']})")
 
     output_path = f"barycenter_results_{run_date}.json"
     with open(output_path, "w") as f:

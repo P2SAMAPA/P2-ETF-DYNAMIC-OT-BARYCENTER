@@ -51,8 +51,10 @@ feature space, but in the geometry of optimal transport?"
         answers the question in the prompt: "which historical market
         state is today's distribution closest to, in distribution
         geometry rather than Euclidean feature space." Each ticker's
-        forecast return is that regime's historical average next-day
-        return for that ticker — computed ONLY from training-period days
+        forecast return is that regime's historical average forward
+        return over the chosen horizon (1 trading day by default in the
+        original design; see trainer.py for why a longer horizon is now
+        also searched) for that ticker — computed ONLY from training-period days
         assigned to the regime, so this is a genuine walk-forward lookup,
         never a look-ahead.
 
@@ -105,6 +107,36 @@ def compute_barycenter_series(returns: np.ndarray, local_window: int,
     return barycenter_series, ticker_quantiles
 
 
+def compute_forward_returns(returns: np.ndarray, horizon: int) -> np.ndarray:
+    """
+    H-day-ahead cumulative forward log return per ticker:
+
+        forward_returns[t] = sum(returns[t+1 : t+1+horizon], axis=0)
+                           == log(price[t+horizon] / price[t])
+
+    i.e. what you'd earn holding from the close on day t to the close on
+    day t+horizon. This is the prediction TARGET used everywhere in this
+    engine when horizon > 1 (see the "Why a forward horizon" note in
+    trainer.py's module docstring) — the barycenter itself is unaffected
+    by horizon, since it's built purely from each ETF's own trailing
+    DAILY return distribution.
+
+    NaN wherever the full horizon hasn't happened yet (the last `horizon`
+    rows of the dataset), matching barycenter_series's own NaN convention
+    so both arrays can be masked the same way by the caller.
+
+    Computed via one cumulative sum — O(n_days), not O(n_days * horizon).
+    """
+    n_days, n_tickers = returns.shape
+    # cumret[k] = sum(returns[0:k]); cumret[0] = 0
+    cumret = np.concatenate([np.zeros((1, n_tickers)), np.cumsum(returns, axis=0)], axis=0)
+    forward = np.full((n_days, n_tickers), np.nan)
+    valid_end = n_days - horizon
+    if valid_end > 0:
+        forward[:valid_end] = cumret[horizon + 1: n_days + 1] - cumret[1: n_days - horizon + 1]
+    return forward
+
+
 def wasserstein2_dist(q1: np.ndarray, q2: np.ndarray) -> float:
     """W2 distance between two 1-D distributions given as quantile
     functions == plain Euclidean distance between them (see module docstring)."""
@@ -113,7 +145,8 @@ def wasserstein2_dist(q1: np.ndarray, q2: np.ndarray) -> float:
 
 class RegimeBarycenterModel:
     """Fits historical regime centroids over a window of barycenters, and
-    predicts next-day returns for today by nearest-regime lookup."""
+    predicts a forward return (over whatever horizon the caller's training
+    targets represent) for today by nearest-regime lookup."""
 
     def __init__(self, n_regimes: int = 6, random_state: int = 42):
         self.n_regimes_requested = n_regimes
@@ -170,7 +203,7 @@ class RegimeBarycenterModel:
 
     def predict(self, B_today: np.ndarray) -> Dict:
         """Nearest-regime label + distance, runner-up distance (regime
-        separation/confidence), and the predicted next-day return vector."""
+        separation/confidence), and the predicted forward return vector."""
         centers = self.kmeans.cluster_centers_
         dists = np.sqrt(np.sum((centers - np.asarray(B_today).reshape(1, -1)) ** 2, axis=1))
         order = np.argsort(dists)
@@ -237,7 +270,7 @@ def predict_with_hysteresis(model: "RegimeBarycenterModel", B_today: np.ndarray,
 
 
 def nearest_analog_days(B_today: np.ndarray, B_history: np.ndarray, dates_history: List[str],
-                         returns_next_history: np.ndarray, tickers: List[str],
+                         forward_returns_history: np.ndarray, tickers: List[str],
                          top_n: int = 5) -> List[Dict]:
     """
     Individual-day analogs (not regime centroids): the `top_n` historical
@@ -246,6 +279,11 @@ def nearest_analog_days(B_today: np.ndarray, B_history: np.ndarray, dates_histor
     "which specific historical day did today's market distribution look
     most like." Purely descriptive/diagnostic; not used to form the
     tradeable forecast (that comes from the regime lookup above).
+
+    `forward_returns_history` should be the same horizon-length cumulative
+    forward return used as the model's prediction target, so what's shown
+    ("what happened after those analog days") is directly comparable to
+    the forecast itself.
     """
     if len(B_history) == 0:
         return []
@@ -256,20 +294,20 @@ def nearest_analog_days(B_today: np.ndarray, B_history: np.ndarray, dates_histor
         out.append({
             "date": dates_history[idx],
             "distance": float(dists[idx]),
-            "next_day_returns": {t: round(float(returns_next_history[idx, j]), 5)
-                                 for j, t in enumerate(tickers)},
+            "forward_returns": {t: round(float(forward_returns_history[idx, j]), 5)
+                                for j, t in enumerate(tickers)},
         })
     return out
 
 
-def get_barycenter_predictions(barycenter_series: np.ndarray, returns: np.ndarray,
-                                window: int, n_regimes: int, min_train_samples: int = 60,
+def get_barycenter_predictions(barycenter_series: np.ndarray, forward_returns: np.ndarray,
+                                window: int, n_regimes: int, horizon: int, min_train_samples: int = 60,
                                 previous_regime: Optional[int] = None,
                                 persistence_margin: float = 0.10) -> Dict:
     """
     Fit a RegimeBarycenterModel on the most recent `window` valid days and
     produce today's (the latest available day's) regime assignment and
-    1-step-ahead return forecast for every ticker in the universe.
+    `horizon`-day-ahead cumulative return forecast for every ticker.
 
     Pass `previous_regime` (e.g. carried over from yesterday's run) to
     apply the same hysteresis as predict_with_hysteresis; leave it None
@@ -282,16 +320,16 @@ def get_barycenter_predictions(barycenter_series: np.ndarray, returns: np.ndarra
 
     today_idx = valid_idx[-1]
     train_idx = valid_idx[(valid_idx >= today_idx - window) & (valid_idx < today_idx)]
-    train_idx = train_idx[train_idx + 1 <= today_idx]
+    train_idx = train_idx[train_idx + horizon <= today_idx]
 
     if len(train_idx) < min_train_samples:
         raise ValueError("Not enough training days for regime fit.")
 
     B_train = barycenter_series[train_idx]
-    returns_next_train = returns[train_idx + 1]
+    fwd_train = forward_returns[train_idx]
 
     model = RegimeBarycenterModel(n_regimes=n_regimes)
-    fit_result = model.fit(B_train, returns_next_train)
+    fit_result = model.fit(B_train, fwd_train)
 
     B_today = barycenter_series[today_idx]
     pred = predict_with_hysteresis(model, B_today, previous_regime, persistence_margin)
